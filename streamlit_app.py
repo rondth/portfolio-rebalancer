@@ -26,6 +26,7 @@ def predict_next_day_volatility(ticker):
     """
     try:
         # 1. Data Loading
+        # Restored to 2015 to match the version you liked
         data = yf.download(ticker, start="2015-01-01", progress=False)
         
         if data.empty:
@@ -39,7 +40,7 @@ def predict_next_day_volatility(ticker):
             except:
                 pass
         
-        # Ensure column names are formatted
+        # Ensure column names are clean
         data.columns = [c.capitalize() for c in data.columns]
         
         # 2. Feature Engineering
@@ -91,6 +92,7 @@ def predict_next_day_volatility(ticker):
         X_train = scaler.fit_transform(X_train)
         X_test = scaler.transform(X_test)
         
+        # Restored to 500 estimators (High Accuracy)
         model = XGBRegressor(learning_rate=0.01, max_depth=4, n_estimators=500, n_jobs=-1, objective="reg:absoluteerror")
         
         val_split = int(len(X_train) * 0.9)
@@ -226,7 +228,6 @@ with tab_app:
             eq_weight = round(100.0 / len(stocks), 2) if len(stocks) > 0 else 0
             st.session_state.weights_df = pd.DataFrame({"Asset": stocks, "Current Weight (%)": [eq_weight]*len(stocks)})
         else:
-            # FIX: Ensure we update the 'Asset' column, not create a new 'Ticker' column
             st.session_state.weights_df["Asset"] = stocks
 
     col_input, col_check = st.columns([2, 1])
@@ -249,7 +250,7 @@ with tab_app:
             hide_index=True
         )
 
-    # --- 100% VALIDATION LOGIC ---
+    # --- VALIDATION LOGIC ---
     total_weight = edited_df["Current Weight (%)"].sum()
     is_valid_sum = 99.0 <= total_weight <= 101.0
     
