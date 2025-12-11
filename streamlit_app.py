@@ -7,202 +7,147 @@ from xgboost import XGBRegressor
 from sklearn.preprocessing import StandardScaler
 import plotly.express as px
 import plotly.graph_objects as go
+import warnings
 
+warnings.filterwarnings("ignore")
+
+# --- 1. Page Configuration ---
 st.set_page_config(
-    page_title="Smart Portfolio Rebalancer",
-    page_icon="🧠",
+    page_title="ML Smart Portfolio Rebalancer",
     layout="wide",
-    initial_sidebar_state="expanded"
 )
 
-st.markdown("""
-<style>
-    /* Main Background */
-    .stApp {
-        background-color: #0e1117;
-        color: #fafafa;
-    }
-    /* Headers */
-    h1, h2, h3 {
-        font-family: 'Roboto', sans-serif;
-        font-weight: 600;
-        color: #ffffff;
-    }
-    /* Card-like containers for metrics */
-    .css-1r6slb0 {
-        background-color: #1f2937;
-        border: 1px solid #374151;
-        padding: 20px;
-        border-radius: 10px;
-    }
-    /* Sidebar Styling */
-    .css-1d391kg {
-        background-color: #111827;
-    }
-    /* Button Styling */
-    .stButton>button {
-        background-color: #2563eb;
-        color: white;
-        border: none;
-        border-radius: 6px;
-        height: 3em;
-        font-weight: bold;
-    }
-    .stButton>button:hover {
-        background-color: #1d4ed8;
-    }
-</style>
-""", unsafe_allow_html=True)
-
-# --- 2. Backend Logic (Cached) ---
+# --- 2. The Core Algorithm ---
 
 @st.cache_data(show_spinner=False)
-def fetch_and_predict(ticker):
+def predict_next_day_volatility(ticker):
     """
-    Fetches data, engineers features, runs GARCH + XGBoost pipeline.
-    Returns: (Predicted Annual Volatility, Historical Prices, Error Message)
+    Replicates the exact logic from 'fintech_capstone_project.py'.
     """
     try:
-        # A. Data Ingestion
-        data = yf.download(ticker, start="2018-01-01", progress=False)
+        # 1. Data Loading
+        data = yf.download(ticker, start="2015-01-01", progress=False)
         
         if data.empty:
-            return None, None, f"No data found for {ticker}."
-            
-        # Clean up column structure if necessary (handle MultiIndex)
+            return None, None, f"No data for {ticker}"
+
+        # Handle yfinance MultiIndex
         if isinstance(data.columns, pd.MultiIndex):
-            # Check if 'Close' is in the top level
             try:
                 if 'Close' in data.columns.get_level_values(0):
-                     # Flatten if possible or select specific ticker level
-                     data = data.xs(ticker, axis=1, level=1, drop_level=True)
+                    data = data.xs(ticker, axis=1, level=1, drop_level=True)
             except:
                 pass
-                
-        # Ensure we have the basic columns
-        required_cols = ['Close', 'High', 'Low', 'Open', 'Volume']
-        if not all(col in data.columns for col in required_cols):
-             # Fallback: sometimes yfinance returns multi-index differently
-             if isinstance(data.columns, pd.MultiIndex):
-                 data.columns = data.columns.get_level_values(0)
-             
-             if not all(col in data.columns for col in required_cols):
-                return None, None, f"Incomplete data schema for {ticker}."
-
-        # B. Feature Engineering
-        data["log_returns"] = np.log(data["Close"] / data["Close"].shift(1)) * 100
         
-        # Target: Realized volatility of the *next* 5 days
+        # Ensure column names are formatted
+        data.columns = [c.capitalize() for c in data.columns]
+        
+        # 2. Feature Engineering
+        data["log_returns"] = np.log(data["Close"] / data["Close"].shift(1)) * 100
+
         window = 5
         indexer = pd.api.indexers.FixedForwardWindowIndexer(window_size=window)
         data["target_volatility"] = data["log_returns"].rolling(window=indexer).std().shift(-1)
 
-        # Lagged Volatility Features
         data["volatility_lag_week"] = data["log_returns"].rolling(5).std().shift(1)
         data["volatility_lag_month"] = data["log_returns"].rolling(22).std().shift(1)
         data["volatility_lag_quarter"] = data["log_returns"].rolling(66).std().shift(1)
+
         data["absolute_returns_lag"] = abs(data["log_returns"].shift(1))
         
-        # Garman-Klass Volatility
+        # Garman Klass Formula
         log_hl = np.log(data["High"] / data["Low"])
         log_co = np.log(data["Close"] / data["Open"])
         data["garman_klass"] = np.sqrt(0.5 * log_hl**2 - (2 * np.log(2) - 1) * log_co**2) * 100
-        
-        # Volume Change
+
         data["vol_change"] = data["Volume"].pct_change()
-        
-        # Cleanup
         data.replace([np.inf, -np.inf], np.nan, inplace=True)
         data.dropna(inplace=True)
-        
-        if len(data) < 252:
-            return None, None, f"Insufficient data points for {ticker} (Need > 1 year)."
 
-        # C. Modeling (GARCH + XGBoost)
-        # Split Data (80/20)
-        split = int(len(data) * 0.8)
-        training = data.iloc[:split].copy()
-        testing = data.iloc[split:].copy()
-        
-        # 1. GARCH (Feature Generation)
-        garch_model = arch_model(training["log_returns"] - training["log_returns"].mean(), 
-                                 vol="EGARCH", p=1, q=1, dist="t")
-        garch_fit = garch_model.fit(disp="off")
-        training["garch_volatility"] = garch_fit.conditional_volatility
-        
-        # Apply parameters to test set
-        garch_test = arch_model(testing["log_returns"] - training["log_returns"].mean(), 
-                                vol="EGARCH", p=1, q=1, dist="t")
-        garch_test_fit = garch_test.fix(garch_fit.params)
-        testing["garch_volatility"] = garch_test_fit.conditional_volatility
-        
-        # 2. XGBoost
-        features = ["log_returns", "volatility_lag_week", "volatility_lag_month", 
-                    "volatility_lag_quarter", "garch_volatility", "absolute_returns_lag", 
-                    "vol_change", "garman_klass"]
-        
+        if len(data) < 200:
+            return None, None, "Insufficient data"
+
+        # 3. GARCH Modeling
+        split_idx = int(len(data)*0.8)
+        training = data.iloc[:split_idx].copy()
+        testing = data.iloc[split_idx:].copy()
+
+        training_garch_model = arch_model(training["log_returns"] - training["log_returns"].mean(), vol="EGARCH", p=1, q=1, dist="t")
+        training_garch_model_fit = training_garch_model.fit(disp="off")
+        training["garch_volatility"] = training_garch_model_fit.conditional_volatility
+
+        testing_garch_model = arch_model(testing["log_returns"] - training["log_returns"].mean(), vol="EGARCH", p=1, q=1, dist="t")
+        testing_garch_model_fix = testing_garch_model.fix(training_garch_model_fit.params)
+        testing["garch_volatility"] = testing_garch_model_fix.conditional_volatility
+
+        # 4. XGBoost Modeling
+        features = ["log_returns", "volatility_lag_week", "volatility_lag_month", "volatility_lag_quarter", "garch_volatility", "absolute_returns_lag", "vol_change", "garman_klass"]
+
         X_train = training[features]
         y_train = training["target_volatility"]
+        X_test = testing[features]
         
         scaler = StandardScaler()
-        X_train_scaled = scaler.fit_transform(X_train)
+        X_train = scaler.fit_transform(X_train)
+        X_test = scaler.transform(X_test)
         
         model = XGBRegressor(learning_rate=0.01, max_depth=4, n_estimators=500, n_jobs=-1, objective="reg:absoluteerror")
-        model.fit(X_train_scaled, y_train)
         
-        # D. Final Prediction (For Tomorrow)
-        # Re-fit GARCH on ALL data to get the absolute latest variance forecast
-        full_data = pd.concat([training, testing])
-        full_garch = arch_model(full_data["log_returns"] - full_data["log_returns"].mean(), vol="EGARCH", p=1, q=1, dist="t")
-        full_garch_fit = full_garch.fix(garch_fit.params)
+        val_split = int(len(X_train) * 0.9)
+        X_tr, X_val = X_train[:val_split], X_train[val_split:]
+        y_tr, y_val = y_train[:val_split], y_train[val_split:]
+        model.fit(X_tr, y_tr, eval_set=[(X_val, y_val)], verbose=False)
+
+        # 5. Final Prediction
+        data_full = pd.concat([training, testing], axis=0)
+        last_row = data_full.iloc[[-1]][features].copy()
         
-        # Forecast 1 step ahead
-        next_day_variance = full_garch_fit.forecast(horizon=1).variance.iloc[-1].values[0]
-        next_day_garch_vol = np.sqrt(next_day_variance)
+        full_garch = arch_model(data_full["log_returns"] - data_full["log_returns"].mean(), vol="EGARCH", p=1, q=1, dist="t")
+        full_garch_fit = full_garch.fix(training_garch_model_fit.params)
+        next_day_garch = full_garch_fit.forecast(horizon=1).variance.iloc[-1].values[0]**0.5
         
-        # Prepare input vector for XGBoost
-        last_row = full_data.iloc[[-1]][features].copy()
-        last_row["garch_volatility"] = next_day_garch_vol # Update with forecast
-        
-        last_row_scaled = scaler.transform(last_row)
-        predicted_vol = model.predict(last_row_scaled)[0]
-        
-        annualized_vol = predicted_vol * np.sqrt(252)
-        
-        return annualized_vol, full_data["Close"], None
+        last_row["garch_volatility"] = next_day_garch
+        last_row = scaler.transform(last_row)
+
+        predicted_daily_vol = model.predict(last_row)[0]
+        annualised_vol = predicted_daily_vol * np.sqrt(252)
+
+        return annualised_vol, data_full["Close"], None
 
     except Exception as e:
         return None, None, str(e)
 
-# --- 3. UI Layout ---
+# --- 3. UI Implementation ---
 
-# Sidebar
-with st.sidebar:
-    st.image("https://img.icons8.com/fluency/96/bullish.png", width=60)
-    st.title("Smart Rebalancer")
-    st.caption("Group 1: Dexun, Thaddus, Eron")
-    st.divider()
-    
-    st.markdown("### ⚙️ Settings")
-    input_tickers = st.text_area("Assets (Comma Separated)", "AAPL, NVDA, MSFT, BTC-USD, GLD", help="Enter stock or crypto symbols").upper()
-    risk_free_rate = st.number_input("Risk Free Rate (%)", value=4.0, step=0.1) / 100
-    mc_sims = st.slider("Monte Carlo Simulations", 500, 5000, 1000)
-    
-    st.divider()
-    st.markdown("Developed with **Streamlit** & **XGBoost**")
+logo_col1, logo_col2, logo_col3 = st.sidebar.columns([1, 2, 1])
+with logo_col2:
+    st.image("https://img.icons8.com/fluency/96/bullish.png", use_container_width=True)
 
-# Main Tabs
-tab_home, tab_how, tab_app = st.tabs(["🏠 Home / Proposal", "🧠 How It Works", "🚀 Live Optimizer"])
+st.sidebar.title("Smart Rebalancer")
+st.sidebar.caption("Group 1: Dexun, Thaddus, Eron")
+st.sidebar.divider()
 
-# --- TAB 1: HOME ---
-with tab_home:
+# Inputs
+default_tickers = "AAPL, NVDA, MSFT, BTC-USD, ETH-USD"
+ticker_input = st.sidebar.text_area("Stocks (Comma Separated)", value=default_tickers)
+risk_free_rate = st.sidebar.number_input("Risk Free Rate", value=0.04, step=0.01)
+num_simulations = st.sidebar.slider("Monte Carlo Simulations", min_value=1000, max_value=10000, value=2500, step=500, help="Higher simulations = more accurate but slower.")
+
+st.sidebar.divider()
+st.sidebar.info("Navigate tabs above to switch between the Proposal details and the Live Tool.")
+
+# --- TABS CONFIGURATION ---
+tab_info, tab_app = st.tabs(["Proposal & Methodology", "Live Optimizer"])
+
+# --- TAB 1: PROPOSAL & METHODOLOGY ---
+with tab_info:
+    # --- SECTION 1: PROPOSAL ---
     st.title("ML-Powered Smart Portfolio Rebalancer")
-    st.markdown("*A Capstone Project by Group 1*")
     
     col1, col2 = st.columns([2, 1])
     
     with col1:
-        st.subheader("📌 Problem Statement")
+        st.subheader("Problem Statement")
         st.write("""
         Modern investors struggle to maintain balanced portfolios in volatile markets. 
         Traditional tools provide static allocations, often missing opportunities to optimize returns or control risks dynamically. 
@@ -212,224 +157,254 @@ with tab_home:
         * Forecast short-term risk accurately.
         """)
         
-        st.subheader("🎯 Project Objective")
+        st.subheader("Project Objective")
         st.write("""
         Build a machine learning-powered system that:
-        1. **Predicts** short-term volatility using XGBoost & GARCH.
+        1. **Predicts** short-term volatility using XGBoost & EGARCH.
         2. **Evaluates** portfolio risk in real-time.
         3. **Recommends** optimal rebalancing actions (Buy/Sell) to maximize the Sharpe Ratio.
         """)
 
     with col2:
         st.info("### Key Features\n"
-                "✅ **Multi-Asset Support** (Stocks & Crypto)\n\n"
-                "✅ **Hybrid ML Models** (GARCH + XGBoost)\n\n"
-                "✅ **Monte Carlo** Simulation\n\n"
-                "✅ **Interactive** Dashboard")
-        
-        st.image("https://images.unsplash.com/photo-1611974765270-ca1258634369?q=80&w=1000&auto=format&fit=crop", caption="Algorithmic Trading", use_container_width=True)
-
-# --- TAB 2: HOW IT WORKS ---
-with tab_how:
-    st.header("The Architecture")
+                "• **Multi-Asset Support** (Stocks & Crypto)\n\n"
+                "• **Hybrid ML Models** (EGARCH + XGBoost)\n\n"
+                "• **Monte Carlo** Simulation\n\n"
+                "• **Interactive** Dashboard")
+    
+    # --- SECTION 2: HOW IT WORKS ---
+    st.divider()
+    st.header("How It Works")
     st.write("Our system pipelines financial data through three distinct stages to generate actionable insights.")
     
-    st.markdown("### 1. Feature Engineering")
-    st.code("""
-    # Inputs:
-    - Log Returns
-    - Garman-Klass Volatility (High/Low/Open/Close)
-    - Volume Shocks
-    - Lagged Volatility (Week, Month, Quarter)
-    """, language="python")
+    # Architecture Columns
+    c_a, c_b, c_c = st.columns(3)
     
-    st.markdown("---")
-    
-    col_a, col_b = st.columns(2)
-    with col_a:
+    with c_a:
+        st.markdown("### 1. Feature Engineering")
+        st.write("We extract advanced statistical features from raw market data.")
+        st.code("""
+# Inputs:
+- Log Returns
+- Garman-Klass Volatility
+- Volume Shocks
+- Lagged Volatility
+        """, language="python")
+
+    with c_b:
         st.markdown("### 2. The Hybrid Model")
-        st.write("""
-        We use a **Residual Learning** approach:
-        1. **GARCH (EGARCH)** captures the 'clustering' of volatility (heteroskedasticity).
-        2. **XGBoost** takes the GARCH output + other market features to correct the error and handle non-linear relationships.
-        """)
-    with col_b:
-        st.markdown("### 3. Optimization Engine")
-        st.write("""
-        We don't just predict risk; we use it.
-        1. **Prediction:** ML model outputs `Predicted Volatility` for tomorrow.
-        2. **Covariance:** We construct a forward-looking covariance matrix.
-        3. **Markowitz:** We run Monte Carlo simulations to find the 'Efficient Frontier'.
+        st.write("We use a **Residual Learning** approach:")
+        st.info("""
+        1. **EGARCH (a variant of GARCH)** captures volatility clustering.
+        2. **XGBoost** corrects the error using non-linear market features.
         """)
 
-# --- TAB 3: LIVE APP ---
+    with c_c:
+        st.markdown("### 3. Optimization")
+        st.write("We turn predictions into decisions:")
+        st.success("""
+        1. Predict **Next-Day Volatility**.
+        2. Construct **Future Covariance Matrix**.
+        3. Run **Monte Carlo** to maximize Sharpe Ratio.
+        """)
+
+# --- TAB 2: LIVE APP ---
 with tab_app:
-    st.header("Portfolio Dashboard")
+    st.title("Live Portfolio Dashboard")
     
-    # Process Inputs
-    tickers = [t.strip() for t in input_tickers.split(",") if t.strip()]
-    
-    st.subheader("Step 1: Define Current Portfolio")
-    
-    # Create an initial dataframe for user input
-    if 'current_weights_df' not in st.session_state:
-        # Default equal weight for initial load
-        st.session_state.current_weights_df = pd.DataFrame({
-            "Asset": tickers,
-            "Current Weight (%)": [round(100.0/len(tickers), 2)] * len(tickers)
-        })
+    # Process Tickers
+    stocks = [s.strip().upper() for s in ticker_input.split(",") if s.strip()]
+
+    # Initialize Session State for Weights if needed
+    if "weights_df" not in st.session_state:
+        # Default equal weight
+        eq_weight = round(100.0 / len(stocks), 2) if len(stocks) > 0 else 0
+        st.session_state.weights_df = pd.DataFrame({"Asset": stocks, "Current Weight (%)": [eq_weight]*len(stocks)})
     else:
-        # Update if ticker list changed length (basic sync)
-        if len(st.session_state.current_weights_df) != len(tickers):
-             st.session_state.current_weights_df = pd.DataFrame({
-                "Asset": tickers,
-                "Current Weight (%)": [round(100.0/len(tickers), 2)] * len(tickers)
-            })
+        # Sync if ticker list changes length
+        if len(st.session_state.weights_df) != len(stocks):
+            eq_weight = round(100.0 / len(stocks), 2) if len(stocks) > 0 else 0
+            st.session_state.weights_df = pd.DataFrame({"Asset": stocks, "Current Weight (%)": [eq_weight]*len(stocks)})
         else:
-             # Ensure assets match
-             st.session_state.current_weights_df["Asset"] = tickers
+            # FIX: Ensure we update the 'Asset' column, not create a new 'Ticker' column
+            st.session_state.weights_df["Asset"] = stocks
 
-    # Interactive Data Editor
-    edited_df = st.data_editor(
-        st.session_state.current_weights_df,
-        column_config={
-            "Current Weight (%)": st.column_config.NumberColumn(
-                "Current Weight (%)",
-                help="Enter your current portfolio percentage (0-100)",
-                min_value=0,
-                max_value=100,
-                step=0.1,
-                format="%.1f%%"
-            )
-        },
-        disabled=["Asset"],
-        hide_index=True,
-        use_container_width=True
-    )
+    col_input, col_check = st.columns([2, 1])
     
+    with col_input:
+        st.subheader("1. Define Current Allocation")
+        st.write("Enter your **Current Portfolio Weights**:")
+        edited_df = st.data_editor(
+            st.session_state.weights_df, 
+            column_config={
+                "Current Weight (%)": st.column_config.NumberColumn(
+                    "Current Weight (%)",
+                    min_value=0,
+                    max_value=100,
+                    step=0.1,
+                    format="%.1f%%"
+                )
+            },
+            use_container_width=True, 
+            hide_index=True
+        )
+
+    # --- 100% VALIDATION LOGIC ---
     total_weight = edited_df["Current Weight (%)"].sum()
-    if not (99.0 <= total_weight <= 101.0):
-        st.warning(f"⚠️ Current weights sum to {total_weight:.1f}%. They should sum to roughly 100%.")
-
-    st.subheader("Step 2: Run Optimization")
+    is_valid_sum = 99.0 <= total_weight <= 101.0
     
-    if st.button("🚀 Run Analysis & Rebalance", type="primary"):
-        if len(tickers) < 2:
-            st.error("Please enter at least 2 assets to create a portfolio.")
+    with col_check:
+        st.subheader("Validation")
+        st.metric("Total Allocation", f"{total_weight:.1f}%")
+        
+        if is_valid_sum:
+            st.success("Allocation is valid.")
+            ready_to_run = True
         else:
-            # 1. Calculation Phase
-            status = st.status("Processing Market Data...", expanded=True)
+            st.error("Weights must sum to approx 100%.")
+            ready_to_run = False
+
+    st.divider()
+    
+    # Run Button
+    if st.button("Run Prediction & Optimization", type="primary", disabled=not ready_to_run):
+        if len(stocks) < 2:
+            st.error("Please enter at least 2 stocks.")
+        else:
+            # --- EXECUTION PHASE ---
+            status = st.status("Processing Models...", expanded=True)
             
-            results = {}
-            prices_df = pd.DataFrame()
-            failed = []
+            # 1. Prediction Loop
+            predicted_annual_volatilities = []
+            valid_stocks = []
+            price_data_list = []
             
             progress_bar = status.progress(0)
             
-            for i, t in enumerate(tickers):
-                status.write(f"Analyzing **{t}** with XGBoost...")
-                vol, price_series, err = fetch_and_predict(t)
+            for i, stock in enumerate(stocks):
+                status.write(f"Analyzing **{stock}** (EGARCH + XGBoost)...")
+                vol, prices, err = predict_next_day_volatility(stock)
                 
-                if err:
-                    failed.append(f"{t}: {err}")
+                if vol is not None:
+                    predicted_annual_volatilities.append(vol)
+                    valid_stocks.append(stock)
+                    price_data_list.append(prices.rename(stock))
                 else:
-                    results[t] = vol
-                    # Align price series dates
-                    if prices_df.empty:
-                        prices_df = pd.DataFrame(price_series)
-                        prices_df.columns = [t]
-                    else:
-                        prices_df = prices_df.join(price_series.rename(t), how="inner")
+                    status.warning(f"Failed to process {stock}: {err}")
                 
-                progress_bar.progress((i + 1) / len(tickers))
+                progress_bar.progress((i + 1) / len(stocks))
             
-            if failed:
-                for f in failed:
-                    status.warning(f)
-            
-            valid_assets = list(results.keys())
-            
-            if len(valid_assets) < 2:
-                status.error("Not enough valid assets to optimize. Check your tickers.")
-                status.update(state="error")
+            if len(valid_stocks) < 2:
+                status.update(label="Error: Not enough valid data", state="error")
+                st.error("Not enough valid stocks to optimize.")
             else:
-                status.write("Running Monte Carlo Simulations...")
+                # 2. Covariance Matrix Calculation
+                status.write("Constructing Future Covariance Matrix...")
+                price_df = pd.concat(price_data_list, axis=1)
+                returns_data = np.log(price_df / price_df.shift(1))
+                returns_data.dropna(inplace=True)
                 
-                # 2. Optimization Phase
-                returns_log = np.log(prices_df / prices_df.shift(1)).dropna()
-                corr_matrix = returns_log.corr()
+                correlation_matrix = returns_data.corr()
                 
-                # D = Diagonal matrix of Predicted Annual Volatilities
-                vols_vector = np.array([results[a] for a in valid_assets]) / 100 
-                D = np.diag(vols_vector)
+                # The Future Covariance
+                D = np.diag(np.array(predicted_annual_volatilities) / 100)
+                future_covariance_matrix = D @ correlation_matrix.values @ D
+
+                # --- MODEL OUTPUTS ---
+                status.write("Generating Intermediate Outputs...")
+                st.divider()
+                st.subheader("Intermediate Model Outputs")
+                col_mod1, col_mod2 = st.columns(2)
+                with col_mod1:
+                    st.markdown("**Predicted Annualized Volatilities (XGBoost):**")
+                    vol_df = pd.DataFrame({
+                        "Asset": valid_stocks, 
+                        "Predicted Vol (%)": [f"{v:.4f}" for v in predicted_annual_volatilities]
+                    })
+                    st.dataframe(vol_df, hide_index=True)
+                with col_mod2:
+                    st.markdown("**Future Covariance Matrix (Annualized):**")
+                    st.dataframe(pd.DataFrame(future_covariance_matrix, columns=valid_stocks, index=valid_stocks))
+                st.divider()
+                # ---------------------
+
+                # 3. Monte Carlo Simulation
+                status.write(f"Running {num_simulations} Monte Carlo Simulations...")
+                num_portfolios = num_simulations
                 
-                future_cov = D @ corr_matrix.values @ D
+                returns = []
+                volatilities = []
+                allocations = []
                 
-                # Monte Carlo
-                sim_results = []
-                mean_daily_ret = returns_log.mean()
-                mean_annual_ret = mean_daily_ret * 252
-                
-                for _ in range(mc_sims):
-                    w = np.random.random(len(valid_assets))
+                mean_daily_returns = returns_data.mean()
+                mean_annual_returns = mean_daily_returns * 252
+                mean_annual_returns = mean_annual_returns[valid_stocks]
+
+                for port in range(num_portfolios):
+                    w = np.random.random(len(valid_stocks))
                     w /= np.sum(w)
+                    allocations.append(w)
                     
-                    p_ret = np.dot(w, mean_annual_ret[valid_assets])
-                    p_var = w.T @ future_cov @ w
-                    p_vol = np.sqrt(p_var)
-                    p_sharpe = (p_ret - risk_free_rate) / p_vol
+                    returns.append(np.dot(w, mean_annual_returns))
                     
-                    sim_results.append([p_ret, p_vol, p_sharpe] + list(w))
+                    var = np.transpose(w).dot(future_covariance_matrix).dot(w)
+                    volatilities.append(np.sqrt(var))
+
+                # Create Portfolio DataFrame
+                data2 = {"Returns": returns, "Volatilities": volatilities}
+                for counter, symbol in enumerate(valid_stocks):
+                    data2[symbol] = [allocation[counter] for allocation in allocations]
                 
-                columns = ['Return', 'Volatility', 'Sharpe'] + valid_assets
-                df_sim = pd.DataFrame(sim_results, columns=columns)
+                portfolio = pd.DataFrame(data2)
                 
-                # Best Portfolios
-                max_sharpe_port = df_sim.iloc[df_sim['Sharpe'].idxmax()]
+                sharpe_ratios = (portfolio["Returns"] - risk_free_rate) / portfolio["Volatilities"]
+                max_sharpe_idx = sharpe_ratios.idxmax()
+                highest_sharpe_portfolio = portfolio.iloc[max_sharpe_idx]
+
+                status.update(label="Optimization Complete", state="complete", expanded=False)
+
+                # --- 4. Final Display ---
                 
-                status.update(label="Analysis Complete!", state="complete", expanded=False)
-                
-                # 3. Visualization Phase
-                
-                # Row 1: Metrics
+                # Metrics
                 m1, m2, m3 = st.columns(3)
-                m1.metric("Optimal Sharpe Ratio", f"{max_sharpe_port['Sharpe']:.2f}", delta="Maximized")
-                m2.metric("Predicted Annual Return", f"{max_sharpe_port['Return']:.2%}")
-                m3.metric("Predicted Annual Risk", f"{max_sharpe_port['Volatility']:.2%}", delta_color="inverse")
+                m1.metric("Optimal Sharpe Ratio", f"{sharpe_ratios.max():.2f}", delta="Maximized")
+                m2.metric("Expected Return", f"{highest_sharpe_portfolio['Returns']*100:.2f}%")
+                m3.metric("Expected Volatility", f"{highest_sharpe_portfolio['Volatilities']*100:.2f}%", delta_color="inverse")
                 
                 st.divider()
                 
-                # Row 2: Charts
+                # Charts
                 c1, c2 = st.columns([2, 1])
                 
                 with c1:
                     st.subheader("Efficient Frontier")
-                    fig_ef = px.scatter(
-                        df_sim, x="Volatility", y="Return", color="Sharpe",
+                    fig = px.scatter(
+                        portfolio, 
+                        x="Volatilities", 
+                        y="Returns", 
                         title="Monte Carlo Simulation (ML-Adjusted)",
-                        color_continuous_scale="RdYlGn",
-                        labels={"Return": "Expected Return", "Volatility": "Predicted Volatility"}
+                        labels={"Volatilities": "Expected Volatility", "Returns": "Expected Returns"},
+                        color=sharpe_ratios,
+                        color_continuous_scale="Viridis"
                     )
-                    # Add Star for Max Sharpe
-                    fig_ef.add_trace(go.Scatter(
-                        x=[max_sharpe_port['Volatility']], 
-                        y=[max_sharpe_port['Return']],
-                        mode='markers', marker=dict(color='red', size=15, symbol='star'),
-                        name="Optimal Portfolio"
+                    fig.add_trace(go.Scatter(
+                        x=[highest_sharpe_portfolio["Volatilities"]],
+                        y=[highest_sharpe_portfolio["Returns"]],
+                        mode='markers',
+                        marker=dict(color='red', size=20, symbol='star'),
+                        name='Max Sharpe Ratio'
                     ))
-                    st.plotly_chart(fig_ef, use_container_width=True)
-                
+                    st.plotly_chart(fig, use_container_width=True)
+
                 with c2:
-                    st.subheader("Current vs Optimal")
-                    
+                    st.subheader("Comparison")
                     # Prepare comparison data
-                    # Get user weights, normalize to match valid assets if some failed
-                    user_weights_map = {row['Asset']: row['Current Weight (%)']/100.0 for _, row in edited_df.iterrows()}
+                    user_input_map = dict(zip(edited_df["Asset"], edited_df["Current Weight (%)"]))
                     
                     comp_data = []
-                    for asset in valid_assets:
-                        curr = user_weights_map.get(asset, 0.0)
-                        opt = max_sharpe_port[asset]
+                    for asset in valid_stocks:
+                        curr = user_input_map.get(asset, 0.0)
+                        opt = highest_sharpe_portfolio[asset] * 100
                         comp_data.append({"Asset": asset, "Type": "Current", "Weight": curr})
                         comp_data.append({"Asset": asset, "Type": "Optimal", "Weight": opt})
                     
@@ -438,32 +413,29 @@ with tab_app:
                     fig_comp = px.bar(df_comp, x="Asset", y="Weight", color="Type", barmode="group",
                                       color_discrete_map={"Current": "#94a3b8", "Optimal": "#22c55e"})
                     st.plotly_chart(fig_comp, use_container_width=True)
+
+                # --- 5. Rebalancing Recommendations ---
+                st.subheader("Rebalancing Action Plan")
                 
-                # Row 3: Actionable Table
-                st.subheader("📋 Rebalancing Recommendations")
-                
-                rebal_data = []
-                for asset in valid_assets:
-                    curr_w = user_weights_map.get(asset, 0.0)
-                    targ_w = max_sharpe_port[asset]
-                    diff = targ_w - curr_w
+                rebal_rows = []
+                for stock in valid_stocks:
+                    optimal_weight = highest_sharpe_portfolio[stock] * 100
+                    current_weight = user_input_map.get(stock, 0.0)
+                    diff = optimal_weight - current_weight
                     
                     action = "HOLD"
-                    if diff > 0.01: action = f"BUY (+{diff:.1%})"
-                    elif diff < -0.01: action = f"SELL ({diff:.1%})"
+                    if diff > 1.0: action = f"BUY (+{diff:.1f}%)"
+                    elif diff < -1.0: action = f"SELL ({diff:.1f}%)"
                     
-                    rebal_data.append({
-                        "Asset": asset,
-                        "Current Weight": f"{curr_w:.1%}",
-                        "Target Weight": f"{targ_w:.1%}",
-                        "Difference": f"{diff:+.1%}",
+                    rebal_rows.append({
+                        "Asset": stock,
+                        "Current Weight": f"{current_weight:.2f}%",
+                        "Optimal Weight": f"{optimal_weight:.2f}%",
+                        "Difference": f"{diff:+.2f}%",
                         "Action": action,
-                        "Predicted Vol": f"{results[asset]:.2f}%"
+                        "Predicted Vol": f"{predicted_annual_volatilities[valid_stocks.index(stock)]:.2f}%"
                     })
                 
-                st.dataframe(pd.DataFrame(rebal_data), hide_index=True, use_container_width=True)
-                
-                st.info("💡 **Note:** 'Target Weight' is derived from maximizing the Sharpe Ratio using XGBoost volatility predictions for tomorrow.")
-
-    else:
-        st.write("👈 **Adjust settings in the sidebar**, define your current weights above, and click 'Run Analysis'.")
+                df_rebal = pd.DataFrame(rebal_rows)
+                df_rebal.index = df_rebal.index + 1
+                st.dataframe(df_rebal, use_container_width=True)
